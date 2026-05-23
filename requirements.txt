@@ -1,0 +1,20 @@
+# Check what you have
+apt list --installed 2>/dev/null | grep -i sdl2
+
+# Install Wayland SDL2 backend
+sudo apt install libsdl2-2.0-0 libsdl2-dev \
+     python3-pygame \
+     python3-requests \
+     libwayland-dev
+
+# Verify pygame sees Wayland
+python3 -c "
+import os
+os.environ['SDL_VIDEODRIVER'] = 'wayland'
+import pygame
+pygame.init()
+s = pygame.display.set_mode((100,100))
+print('Driver:', pygame.display.get_driver())
+pygame.quit()
+"
+# Should print: Driver: wayland
