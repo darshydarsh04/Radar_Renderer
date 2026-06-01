@@ -1,0 +1,8 @@
+{
+  "name": "Flight Radar Wallpaper",
+  "description": "Live flight radar as GNOME desktop background via OpenSky API",
+  "uuid": "flight-radar-wallpaper@yourdomain.com",
+  "version": 1,
+  "shell-version": ["45", "46", "47"],
+  "url": ""
+}

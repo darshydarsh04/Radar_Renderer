@@ -1,19 +1,17 @@
 """
 renderer.py — Flight Wallpaper Renderer
 
-Draws a live radar-style map of flights onto a pygame Surface.
+Layout:
+  LEFT PANEL  (35% of screen width) — flight list, stats, location info
+  RIGHT AREA  (65% of screen width) — circular radar, slightly right-of-centre
 
-Visual style: dark aerospace HUD — deep navy background, cyan plane icons,
-phosphor-green trails, amber altitude rings, monospace telemetry readouts.
+Radar is a clipped circle. Only flights inside the circle radius are shown
+on the radar. The left panel lists ALL flights in the bbox with details.
 
-Layers (bottom to top):
-  1. Background gradient
-  2. Grid lines (lat/lon)
-  3. Range rings (decorative)
-  4. Flight trails (fading polyline)
-  5. Plane icons (rotated arrow, heading-aware)
-  6. Callsign + altitude labels
-  7. HUD overlay (clock, flight count, bbox label)
+To change location at runtime, call renderer.set_bbox(...) or pass a
+LOCATION name from the LOCATIONS dict in config.
+
+Visual style: deep navy, cyan radar, phosphor trails, monospace HUD.
 """
 
 from __future__ import annotations
@@ -31,45 +29,71 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Colour palette — aerospace HUD
+# Built-in location presets — change location by name
 # ---------------------------------------------------------------------------
 
-C_BG_TOP        = (4,   8,  24)      # deep space navy
-C_BG_BOTTOM     = (8,  18,  40)      # slightly lighter navy at horizon
-C_GRID          = (18,  40,  72)      # subtle grid lines
-C_GRID_BRIGHT   = (24,  56, 100)     # major grid lines (every 5°)
-C_RING          = (14,  48,  88)      # range ring
-C_RING_PULSE    = (0,  160, 220)     # animated pulse ring
-C_TRAIL_HEAD    = (0,  220, 180)     # bright cyan-green trail start
-C_TRAIL_TAIL    = (0,   60,  50)     # fade to near-black
-C_PLANE         = (0,  220, 255)     # cyan plane icon
-C_PLANE_FAST    = (80, 255, 180)     # fast plane (>300 m/s) goes green
-C_PLANE_SLOW    = (255, 180,  40)    # slow/helicopter goes amber
-C_LABEL_CALL    = (160, 230, 255)    # callsign text
-C_LABEL_ALT     = (80,  160, 140)    # altitude text (dimmer)
-C_HUD_PRIMARY   = (0,  200, 255)     # HUD title text
-C_HUD_DIM       = (40, 100, 130)     # HUD secondary text
-C_SCAN_LINE     = (0,  180, 255)     # rotating radar sweep
-C_ORIGIN_RING   = (0,  100, 180)     # dot at centre
+LOCATIONS: dict[str, tuple[str, tuple[float, float, float, float]]] = {
+    "dubai":    ("DUBAI / UAE",        (22.0, 45.0, 30.0, 60.0)),
+    "london":   ("LONDON / UK",        (49.0, -6.0, 53.5,  3.0)),
+    "newyork":  ("NEW YORK / USA",     (39.0,-76.0, 42.5,-71.0)),
+    "tokyo":    ("TOKYO / JAPAN",      (33.0,136.0, 37.0,142.0)),
+    "paris":    ("PARIS / FRANCE",     (47.0,  0.5, 50.0,  5.5)),
+    "sydney":   ("SYDNEY / AUSTRALIA", (-36.0,148.0,-31.0,153.0)),
+    "singapore":("SINGAPORE",          (  1.0,102.0,  2.5,105.0)),
+    "edinburgh":("EDINBURGH AIRPORT",  (55.5, -4.5, 56.0, -3.0)),
+}
 
-TRAIL_LENGTH    = 24          # max trail positions stored per flight
-TRAIL_MIN_DIST  = 0.0005      # min geo-distance before new trail point added
-LABEL_FONT_SIZE = 11
-HUD_FONT_SIZE   = 13
-HUD_TITLE_SIZE  = 16
-
-# Speed thresholds (m/s) for plane colour
-SPEED_FAST      = 220
-SPEED_SLOW      = 60
+DEFAULT_LOCATION = "edinburgh"
 
 
 # ---------------------------------------------------------------------------
-# Trail store — lives in the renderer, keyed by icao24
+# Colours
+# ---------------------------------------------------------------------------
+
+C_BG            = (4,   8,  24)
+C_BG2           = (8,  18,  40)
+C_PANEL_BG      = (6,  12,  30)
+C_PANEL_BORDER  = (18,  50,  90)
+C_GRID          = (14,  34,  62)
+C_RING          = (16,  44,  82)
+C_RING_BRIGHT   = (0,   80, 140)
+C_PULSE         = (0,  160, 220)
+C_TRAIL_HEAD    = (0,  220, 180)
+C_TRAIL_TAIL    = (0,   50,  40)
+C_PLANE         = (0,  220, 255)
+C_PLANE_FAST    = (80, 255, 180)
+C_PLANE_SLOW    = (255, 180,  40)
+C_LABEL_CALL    = (160, 230, 255)
+C_LABEL_ALT     = (70,  150, 130)
+C_HUD_PRIMARY   = (0,  200, 255)
+C_HUD_DIM       = (40, 100, 130)
+C_HUD_MID       = (80, 160, 180)
+C_SCAN          = (0,  180, 255)
+C_DIVIDER       = (20,  55,  95)
+C_SELECTED      = (255, 220,  60)
+C_CLIP_MASK     = (4,   8,  24)   # same as bg — used to erase outside circle
+
+TRAIL_LENGTH    = 20
+TRAIL_MIN_DIST  = 0.0005
+LABEL_FONT_SIZE = 10
+HUD_FONT_SIZE   = 12
+HUD_TITLE_SIZE  = 22
+PANEL_FONT_SIZE = 11
+PANEL_TITLE_SIZE= 13
+
+SPEED_FAST = 220
+SPEED_SLOW = 60
+
+# Left panel takes this fraction of screen width
+PANEL_RATIO = 0.32
+
+
+# ---------------------------------------------------------------------------
+# TrailStore
 # ---------------------------------------------------------------------------
 
 @dataclass
 class TrailStore:
-    """Keeps the last N geo-positions for each flight, for drawing trails."""
     max_length: int = TRAIL_LENGTH
     _data: dict[str, list[tuple[float, float]]] = field(
         default_factory=dict, repr=False
@@ -78,10 +102,9 @@ class TrailStore:
     def update(self, icao24: str, lon: float, lat: float) -> None:
         trail = self._data.setdefault(icao24, [])
         if trail:
-            last_lon, last_lat = trail[-1]
-            dist = math.hypot(lon - last_lon, lat - last_lat)
+            dist = math.hypot(lon - trail[-1][0], lat - trail[-1][1])
             if dist < TRAIL_MIN_DIST:
-                return                          # hasn't moved enough
+                return
         trail.append((lon, lat))
         if len(trail) > self.max_length:
             trail.pop(0)
@@ -89,56 +112,62 @@ class TrailStore:
     def get(self, icao24: str) -> list[tuple[float, float]]:
         return self._data.get(icao24, [])
 
-    def prune(self, active_icao24s: set[str]) -> None:
-        """Remove trails for flights no longer in the feed."""
-        stale = set(self._data) - active_icao24s
-        for k in stale:
+    def prune(self, active: set[str]) -> None:
+        for k in set(self._data) - active:
             del self._data[k]
 
 
 # ---------------------------------------------------------------------------
-# Projection helpers (self-contained so renderer doesn't import config)
+# Projector — maps geo coords onto the RADAR CIRCLE area only
 # ---------------------------------------------------------------------------
 
 class Projector:
-    """Equirectangular geo→pixel projection for a given bounding box."""
+    """
+    Projects geo coords into the radar circle.
+
+    The radar circle is centred at (radar_cx, radar_cy) with radius radar_r.
+    The bbox centre maps to the circle centre; bbox edges map to the radius.
+    """
 
     def __init__(
         self,
         bbox: tuple[float, float, float, float],
-        screen_w: int,
-        screen_h: int,
+        radar_cx: int,
+        radar_cy: int,
+        radar_r:  int,
     ) -> None:
         self.lat_min, self.lon_min, self.lat_max, self.lon_max = bbox
-        self.w = screen_w
-        self.h = screen_h
+        self.radar_cx = radar_cx
+        self.radar_cy = radar_cy
+        self.radar_r  = radar_r
+
+        self._mid_lon = (self.lon_min + self.lon_max) / 2
+        self._mid_lat = (self.lat_min + self.lat_max) / 2
+        self._span_lon = (self.lon_max - self.lon_min) / 2   # half-span
+        self._span_lat = (self.lat_max - self.lat_min) / 2
 
     def project(self, lon: float, lat: float) -> tuple[int, int]:
-        x = (lon - self.lon_min) / (self.lon_max - self.lon_min) * self.w
-        y = (self.lat_max - lat) / (self.lat_max - self.lat_min) * self.h
-        return int(x), int(y)
+        nx = (lon - self._mid_lon) / self._span_lon   # -1..1
+        ny = (lat - self._mid_lat) / self._span_lat   # -1..1
+        x = self.radar_cx + int(nx * self.radar_r)
+        y = self.radar_cy - int(ny * self.radar_r)    # y flipped
+        return x, y
+
+    def in_radar(self, lon: float, lat: float) -> bool:
+        """Returns True if the point falls inside the radar circle."""
+        x, y = self.project(lon, lat)
+        dx, dy = x - self.radar_cx, y - self.radar_cy
+        return math.hypot(dx, dy) <= self.radar_r
 
     def centre(self) -> tuple[int, int]:
-        mid_lon = (self.lon_min + self.lon_max) / 2
-        mid_lat = (self.lat_min + self.lat_max) / 2
-        return self.project(mid_lon, mid_lat)
-
-    def lon_to_x(self, lon: float) -> int:
-        return int((lon - self.lon_min) / (self.lon_max - self.lon_min) * self.w)
-
-    def lat_to_y(self, lat: float) -> int:
-        return int((self.lat_max - lat) / (self.lat_max - self.lat_min) * self.h)
+        return self.radar_cx, self.radar_cy
 
 
 # ---------------------------------------------------------------------------
 # Drawing primitives
 # ---------------------------------------------------------------------------
 
-def _lerp_colour(
-    c1: tuple[int, int, int],
-    c2: tuple[int, int, int],
-    t: float,
-) -> tuple[int, int, int]:
+def _lerp_colour(c1, c2, t):
     return (
         int(c1[0] + (c2[0] - c1[0]) * t),
         int(c1[1] + (c2[1] - c1[1]) * t),
@@ -146,7 +175,7 @@ def _lerp_colour(
     )
 
 
-def _plane_colour(velocity: float) -> tuple[int, int, int]:
+def _plane_colour(velocity: float):
     if velocity >= SPEED_FAST:
         return C_PLANE_FAST
     if velocity <= SPEED_SLOW:
@@ -154,453 +183,441 @@ def _plane_colour(velocity: float) -> tuple[int, int, int]:
     return C_PLANE
 
 
-def _draw_plane_icon(
-    surface: pygame.Surface,
-    cx: int,
-    cy: int,
-    heading_deg: float,
-    colour: tuple[int, int, int],
-    size: int = 8,
-) -> None:
-    """
-    Draw a minimal arrow-plane icon rotated to heading.
-    heading_deg: 0=north, clockwise.
-    The arrow points in the direction of travel.
-    """
-    # Arrow defined pointing UP (north = 0°), then rotated
-    # Points: nose, left wing, tail, right wing
+def _draw_plane_icon(surface, cx, cy, heading_deg, colour, size=7):
     half = size
     tip   = (0, -half * 1.6)
     lwing = (-half, half * 0.4)
     tail  = (0,  half * 0.6)
     rwing = ( half, half * 0.4)
-
     rad = math.radians(heading_deg)
     cos_a, sin_a = math.cos(rad), math.sin(rad)
 
-    def rotate(px: float, py: float) -> tuple[int, int]:
-        rx = px * cos_a - py * sin_a
-        ry = px * sin_a + py * cos_a
-        return int(cx + rx), int(cy + ry)
+    def rot(px, py):
+        return int(cx + px * cos_a - py * sin_a), int(cy + px * sin_a + py * cos_a)
 
-    pts = [rotate(*tip), rotate(*lwing), rotate(*tail), rotate(*rwing)]
-
-    # Filled body
+    pts = [rot(*tip), rot(*lwing), rot(*tail), rot(*rwing)]
     pygame.draw.polygon(surface, colour, pts)
-
-    # Bright outline for legibility
-    bright = _lerp_colour(colour, (255, 255, 255), 0.4)
-    pygame.draw.polygon(surface, bright, pts, 1)
-
-    # Nose dot
-    nx, ny = rotate(*tip)
+    pygame.draw.polygon(surface, _lerp_colour(colour, (255,255,255), 0.4), pts, 1)
+    nx, ny = rot(*tip)
     pygame.gfxdraw.filled_circle(surface, nx, ny, 2, (*colour, 200))
 
 
-def _draw_trail(
-    surface: pygame.Surface,
-    points: list[tuple[int, int]],
-    colour_head: tuple[int, int, int],
-    colour_tail: tuple[int, int, int],
-) -> None:
-    """Draw a fading polyline trail."""
+def _draw_trail(surface, points, c_head, c_tail):
     n = len(points)
     if n < 2:
         return
     for i in range(1, n):
-        t = i / (n - 1)                    # 0=tail, 1=head
-        col = _lerp_colour(colour_tail, colour_head, t)
-        alpha = int(40 + 180 * t)
-        # Use a small surface for alpha blending per segment
-        x1, y1 = points[i - 1]
-        x2, y2 = points[i]
-        pygame.draw.line(surface, (*col, alpha), (x1, y1), (x2, y2), 1)
+        t = i / (n - 1)
+        col = _lerp_colour(c_tail, c_head, t)
+        alpha = int(30 + 170 * t)
+        pygame.draw.line(surface, (*col, alpha), points[i-1], points[i], 1)
 
 
 # ---------------------------------------------------------------------------
-# Background layers
+# Radar circle drawing
 # ---------------------------------------------------------------------------
 
-def _draw_background_gradient(
+def _draw_radar(
     surface: pygame.Surface,
-    w: int,
-    h: int,
-    bg_surf: pygame.Surface | None,
-) -> pygame.Surface:
-    """
-    Draw a vertical gradient background.
-    Returns a cached Surface so we only rebuild when size changes.
-    """
-    if bg_surf is None or bg_surf.get_size() != (w, h):
-        bg_surf = pygame.Surface((w, h))
-        for y in range(h):
-            t = y / h
-            col = _lerp_colour(C_BG_TOP, C_BG_BOTTOM, t)
-            pygame.draw.line(bg_surf, col, (0, y), (w, y))
-    surface.blit(bg_surf, (0, 0))
-    return bg_surf
-
-
-def _draw_grid(
-    surface: pygame.Surface,
-    proj: Projector,
-    grid_step: float = 1.0,
+    cx: int, cy: int, r: int,
+    pulse_t: float,
+    scan_angle: float,
 ) -> None:
-    """Draw lat/lon grid lines."""
-    lat_min, lon_min, lat_max, lon_max = (
-        proj.lat_min, proj.lon_min, proj.lat_max, proj.lon_max
-    )
+    """Draw the full radar circle: rings, grid lines, sweep, pulse."""
     w, h = surface.get_size()
+    radar_surf = pygame.Surface((w, h), pygame.SRCALPHA)
 
-    lon = math.ceil(lon_min / grid_step) * grid_step
-    while lon <= lon_max:
-        x = proj.lon_to_x(lon)
-        is_major = abs(lon % 5) < 0.001
-        col = C_GRID_BRIGHT if is_major else C_GRID
-        pygame.draw.line(surface, col, (x, 0), (x, h), 1)
-        lon += grid_step
+    # Concentric rings
+    for i in range(1, 5):
+        ring_r = int(r * i / 4)
+        alpha = 30 + i * 15
+        pygame.gfxdraw.aacircle(radar_surf, cx, cy, ring_r, (*C_RING, alpha))
 
-    lat = math.ceil(lat_min / grid_step) * grid_step
-    while lat <= lat_max:
-        y = proj.lat_to_y(lat)
-        is_major = abs(lat % 5) < 0.001
-        col = C_GRID_BRIGHT if is_major else C_GRID
-        pygame.draw.line(surface, col, (0, y), (w, y), 1)
-        lat += grid_step
+    # Outer ring — bright
+    pygame.gfxdraw.aacircle(radar_surf, cx, cy, r,     (*C_RING_BRIGHT, 180))
+    pygame.gfxdraw.aacircle(radar_surf, cx, cy, r - 1, (*C_RING_BRIGHT, 80))
 
-
-def _draw_range_rings(
-    surface: pygame.Surface,
-    proj: Projector,
-    pulse_alpha: float,         # 0.0–1.0 animated pulse
-) -> None:
-    """Draw concentric decorative range rings from screen centre."""
-    cx, cy = proj.centre()
-    w = surface.get_size()[0]
-    step = w // 6
-
-    ring_surf = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
-
-    for i in range(1, 7):
-        r = i * step
-        alpha = max(0, 80 - i * 10)
-        pygame.gfxdraw.aacircle(ring_surf, cx, cy, r, (*C_RING, alpha))
+    # Cross-hair lines inside circle
+    pygame.draw.line(radar_surf, (*C_GRID, 60), (cx - r, cy), (cx + r, cy), 1)
+    pygame.draw.line(radar_surf, (*C_GRID, 60), (cx, cy - r), (cx, cy + r), 1)
+    # Diagonal cross
+    d = int(r * 0.707)
+    pygame.draw.line(radar_surf, (*C_GRID, 30), (cx-d, cy-d), (cx+d, cy+d), 1)
+    pygame.draw.line(radar_surf, (*C_GRID, 30), (cx+d, cy-d), (cx-d, cy+d), 1)
 
     # Animated pulse ring
-    pulse_r = int(step * 0.5 + pulse_alpha * step * 5.5)
-    pulse_a = int((1 - pulse_alpha) * 120)
-    if 0 < pulse_r < w and pulse_a > 0:
-        pygame.gfxdraw.aacircle(
-            ring_surf, cx, cy, pulse_r, (*C_RING_PULSE, pulse_a)
-        )
+    pulse_r = int(r * 0.1 + pulse_t * r * 0.9)
+    pulse_a = int((1 - pulse_t) * 100)
+    if pulse_a > 0:
+        pygame.gfxdraw.aacircle(radar_surf, cx, cy, pulse_r, (*C_PULSE, pulse_a))
 
-    # Centre dot
-    pygame.gfxdraw.filled_circle(ring_surf, cx, cy, 4, (*C_ORIGIN_RING, 180))
-    pygame.gfxdraw.aacircle(ring_surf, cx, cy, 4, (*C_HUD_PRIMARY, 220))
-
-    surface.blit(ring_surf, (0, 0))
-
-
-def _draw_scan_line(
-    surface: pygame.Surface,
-    proj: Projector,
-    angle_deg: float,
-) -> None:
-    """Rotating radar sweep line with fading wedge."""
-    cx, cy = proj.centre()
-    w, h = surface.get_size()
-    max_r = int(math.hypot(w, h))
-
-    sweep_surf = pygame.Surface((w, h), pygame.SRCALPHA)
-
-    # Sweep wedge (fading arc behind the line)
-    wedge_steps = 30
-    for i in range(wedge_steps):
-        t = i / wedge_steps
-        deg = angle_deg - t * 60          # 60° fade arc
+    # Sweep wedge
+    for i in range(40):
+        t = i / 40
+        deg = scan_angle - t * 70
         rad = math.radians(deg)
-        ex = cx + int(max_r * math.sin(rad))
-        ey = cy - int(max_r * math.cos(rad))
-        alpha = int((1 - t) * 25)
-        if alpha > 0:
-            pygame.draw.line(
-                sweep_surf, (*C_SCAN_LINE, alpha), (cx, cy), (ex, ey), 2
-            )
+        ex = cx + int(r * math.sin(rad))
+        ey = cy - int(r * math.cos(rad))
+        a  = int((1 - t) * 35)
+        if a > 0:
+            pygame.draw.line(radar_surf, (*C_SCAN, a), (cx, cy), (ex, ey), 2)
 
     # Bright sweep line
-    rad = math.radians(angle_deg)
-    ex = cx + int(max_r * math.sin(rad))
-    ey = cy - int(max_r * math.cos(rad))
-    pygame.draw.line(sweep_surf, (*C_SCAN_LINE, 80), (cx, cy), (ex, ey), 1)
+    rad = math.radians(scan_angle)
+    ex  = cx + int(r * math.sin(rad))
+    ey  = cy - int(r * math.cos(rad))
+    pygame.draw.line(radar_surf, (*C_SCAN, 90), (cx, cy), (ex, ey), 1)
 
-    surface.blit(sweep_surf, (0, 0))
+    # Centre dot
+    pygame.gfxdraw.filled_circle(radar_surf, cx, cy, 5, (*C_HUD_PRIMARY, 200))
+    pygame.gfxdraw.aacircle(radar_surf, cx, cy, 5, (*C_HUD_PRIMARY, 255))
+
+    surface.blit(radar_surf, (0, 0))
+
+
+def _clip_to_circle(surface: pygame.Surface, cx: int, cy: int, r: int) -> None:
+    """
+    Erase everything outside the radar circle by drawing the inverse mask.
+    Uses the background colour so planes/trails outside are hidden.
+    """
+    w, h = surface.get_size()
+    mask = pygame.Surface((w, h), pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+
+    # Fill entire mask opaque
+    mask.fill((*C_BG, 255))
+
+    # Cut out the circle — fill with transparent
+    pygame.gfxdraw.filled_circle(mask, cx, cy, r, (0, 0, 0, 0))
+    # Small antialiased border ring to soften the edge
+    for dr in range(3):
+        a = 255 - dr * 80
+        pygame.gfxdraw.aacircle(mask, cx, cy, r - dr, (*C_BG, a))
+
+    surface.blit(mask, (0, 0))
 
 
 # ---------------------------------------------------------------------------
-# HUD overlay
+# Left panel
 # ---------------------------------------------------------------------------
 
-def _draw_hud(
+def _draw_left_panel(
     surface: pygame.Surface,
     font_title: pygame.font.Font,
-    font_hud: pygame.font.Font,
-    flight_count: int,
-    bbox: tuple[float, float, float, float],
+    font_panel: pygame.font.Font,
+    font_dim:   pygame.font.Font,
+    flights: list,
+    bbox: tuple,
+    location_name: str,
     fps: float,
+    panel_w: int,
 ) -> None:
-    """Top-left HUD panel."""
-    w, h = surface.get_size()
-    pad = 18
-    line_h = HUD_FONT_SIZE + 5
+    """Draw the full left panel: title, stats, divider, flight list."""
+    h = surface.get_size()[1]
+    pad = 22
+    line_h = PANEL_FONT_SIZE + 7
 
+    # Panel background
+    panel = pygame.Surface((panel_w, h), pygame.SRCALPHA)
+    panel.fill((*C_PANEL_BG, 220))
+    surface.blit(panel, (0, 0))
+
+    # Right border
+    pygame.draw.line(surface, C_PANEL_BORDER, (panel_w - 1, 0), (panel_w - 1, h), 1)
+    pygame.draw.line(surface, C_DIVIDER,      (panel_w - 2, 0), (panel_w - 2, h), 1)
+
+    y = pad
+
+    # ── Title ──
+    title_surf = font_title.render("FLIGHT", True, C_HUD_PRIMARY)
+    surface.blit(title_surf, (pad, y))
+    y += HUD_TITLE_SIZE + 2
+    title2_surf = font_title.render("RADAR", True, C_HUD_PRIMARY)
+    surface.blit(title2_surf, (pad, y))
+    y += HUD_TITLE_SIZE + 10
+
+    # Location name
+    loc_surf = font_panel.render(location_name, True, C_HUD_MID)
+    surface.blit(loc_surf, (pad, y))
+    y += line_h + 4
+
+    # ── Divider ──
+    pygame.draw.line(surface, C_DIVIDER, (pad, y), (panel_w - pad, y), 1)
+    y += 10
+
+    # ── Stats ──
     now = time.strftime("%H:%M:%S UTC", time.gmtime())
     lat_min, lon_min, lat_max, lon_max = bbox
 
-    lines_left = [
-        (f"FLIGHT RADAR", font_title, C_HUD_PRIMARY),
-        (f"LIVE",         font_hud,   C_PLANE_FAST),
-        (f"",             font_hud,   C_HUD_DIM),
-        (f"{flight_count:>4} AIRCRAFT",    font_hud, C_LABEL_CALL),
-        (f"{now}",                          font_hud, C_HUD_DIM),
-        (f"LAT {lat_min:.1f}°–{lat_max:.1f}°", font_hud, C_HUD_DIM),
-        (f"LON {lon_min:.1f}°–{lon_max:.1f}°", font_hud, C_HUD_DIM),
-        (f"FPS {fps:>5.1f}",                font_hud, C_HUD_DIM),
+    stats = [
+        (f"{len(flights):>3} AIRCRAFT",    C_LABEL_CALL),
+        (now,                               C_HUD_DIM),
+        (f"LAT  {lat_min:.1f}° – {lat_max:.1f}°", C_HUD_DIM),
+        (f"LON  {lon_min:.1f}° – {lon_max:.1f}°", C_HUD_DIM),
+        (f"FPS  {fps:>5.1f}",               C_HUD_DIM),
     ]
-
-    # Semi-transparent panel background
-    panel_w = 180
-    panel_h = len(lines_left) * line_h + pad * 2
-    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-    panel.fill((4, 8, 24, 180))
-    surface.blit(panel, (pad - 8, pad - 8))
-
-    y = pad
-    for text, font, colour in lines_left:
-        if text:
-            surf = font.render(text, True, colour)
-            surface.blit(surf, (pad, y))
+    for text, col in stats:
+        s = font_dim.render(text, True, col)
+        surface.blit(s, (pad, y))
         y += line_h
 
-    # Bottom-right: legend
-    legend = [
-        ("▶  FAST  (>220 m/s)", C_PLANE_FAST),
-        ("▶  CRUISE",           C_PLANE),
-        ("▶  SLOW  (<60 m/s)",  C_PLANE_SLOW),
-    ]
-    ly = h - pad - len(legend) * line_h
-    panel2_w = 200
-    panel2_h = len(legend) * line_h + pad
-    panel2 = pygame.Surface((panel2_w, panel2_h), pygame.SRCALPHA)
-    panel2.fill((4, 8, 24, 160))
-    surface.blit(panel2, (w - panel2_w - pad + 8, ly - 8))
+    y += 6
+    pygame.draw.line(surface, C_DIVIDER, (pad, y), (panel_w - pad, y), 1)
+    y += 10
 
-    for text, colour in legend:
-        surf = font_hud.render(text, True, colour)
-        surface.blit(surf, (w - panel2_w - pad + 16, ly))
-        ly += line_h
+    # ── Legend ──
+    legend_items = [
+        ("▸ FAST  >220 m/s", C_PLANE_FAST),
+        ("▸ CRUISE",         C_PLANE),
+        ("▸ SLOW  <60 m/s",  C_PLANE_SLOW),
+    ]
+    for text, col in legend_items:
+        s = font_dim.render(text, True, col)
+        surface.blit(s, (pad, y))
+        y += line_h
+
+    y += 6
+    pygame.draw.line(surface, C_DIVIDER, (pad, y), (panel_w - pad, y), 1)
+    y += 12
+
+    # ── Flight list header ──
+    hdr = font_panel.render("CALLSIGN   FL    HDG   SPD", True, C_HUD_MID)
+    surface.blit(hdr, (pad, y))
+    y += line_h + 2
+    pygame.draw.line(surface, C_DIVIDER, (pad, y), (panel_w - pad, y), 1)
+    y += 6
+
+    # ── Flight rows ──
+    max_rows = (h - y - pad) // line_h
+    visible  = flights[:max_rows]
+
+    for f in visible:
+        callsign = (f.callsign or f.icao24.upper())[:8].ljust(8)
+        alt_ft   = int(f.altitude * 3.28084)
+        fl       = f"FL{alt_ft // 100:03d}"
+        hdg      = f"{int(f.heading):>3}°"
+        spd      = f"{int(f.velocity):>3}"
+        row      = f"{callsign}  {fl}  {hdg}  {spd}"
+        col      = _plane_colour(f.velocity)
+        s        = font_dim.render(row, True, col)
+        surface.blit(s, (pad, y))
+        y += line_h
+        if y + line_h > h - pad:
+            # Overflow indicator
+            more = font_dim.render(
+                f"  +{len(flights) - len(visible)} more...", True, C_HUD_DIM
+            )
+            surface.blit(more, (pad, y))
+            break
+
+    # ── Bottom: location change hint ──
+    hint1 = font_dim.render("Change location:", True, C_HUD_DIM)
+    hint2 = font_dim.render("set_bbox() or LOCATIONS", True, C_DIVIDER)
+    surface.blit(hint1, (pad, h - pad - line_h * 2))
+    surface.blit(hint2, (pad, h - pad - line_h))
 
 
 # ---------------------------------------------------------------------------
-# Main Renderer class
+# Main Renderer
 # ---------------------------------------------------------------------------
 
 class Renderer:
     """
-    Stateful renderer for the flight wallpaper.
+    Split-layout flight radar renderer.
 
-    Usage:
-        renderer = Renderer(screen, bbox=(22, 45, 30, 60))
-        while True:
-            renderer.draw(flights)
-            pygame.display.flip()
+    Left panel  — flight list and stats
+    Right area  — circular radar centred slightly right of screen centre
+
+    Change location:
+        renderer.set_location("london")
+        renderer.set_bbox((lat_min, lon_min, lat_max, lon_max), "MY CITY")
     """
 
     def __init__(
         self,
         surface: pygame.Surface,
-        bbox: tuple[float, float, float, float] = (22.0, 45.0, 30.0, 60.0),
+        location: str = DEFAULT_LOCATION,
         show_labels: bool = True,
         show_trails: bool = True,
-        show_grid: bool = True,
-        show_rings: bool = True,
-        show_scan: bool = True,
     ) -> None:
-        self.surface      = surface
-        self.bbox         = bbox
-        self.show_labels  = show_labels
-        self.show_trails  = show_trails
-        self.show_grid    = show_grid
-        self.show_rings   = show_rings
-        self.show_scan    = show_scan
+        self.surface     = surface
+        self.show_labels = show_labels
+        self.show_trails = show_trails
 
-        w, h = surface.get_size()
-        self.proj         = Projector(bbox, w, h)
-        self.trails       = TrailStore()
+        loc_name, bbox   = LOCATIONS.get(location, LOCATIONS[DEFAULT_LOCATION])
+        self.bbox        = bbox
+        self.location_name = loc_name
 
-        # Animation state
-        self._start_time  = time.time()
-        self._scan_angle  = 0.0          # degrees, rotates each frame
-        self._pulse_t     = 0.0          # 0–1 loop for range-ring pulse
+        self.trails      = TrailStore()
+        self._scan_angle = 0.0
+        self._pulse_t    = 0.0
         self._bg_surf: pygame.Surface | None = None
+        self._label_cache: dict = {}
+        self._fps_clock  = pygame.time.Clock()
+        self._fps        = 0.0
 
-        # Font setup — monospace for that radar terminal feel
         pygame.font.init()
-        mono = pygame.font.match_font("dejavusansmono,liberationmono,monospace,courier")
+        mono = pygame.font.match_font(
+            "dejavusansmono,liberationmono,ubuntumono,monospace,courier"
+        )
         self._font_label = pygame.font.Font(mono, LABEL_FONT_SIZE)
         self._font_hud   = pygame.font.Font(mono, HUD_FONT_SIZE)
+        self._font_panel = pygame.font.Font(mono, PANEL_FONT_SIZE)
+        self._font_ptitle= pygame.font.Font(mono, PANEL_TITLE_SIZE)
         self._font_title = pygame.font.Font(mono, HUD_TITLE_SIZE)
 
-        # Label surface cache: icao24 → (Surface, Surface) callsign+alt
-        self._label_cache: dict[str, tuple[pygame.Surface, pygame.Surface]] = {}
+        self._update_layout()
 
-        # Per-frame stats
-        self._fps_clock   = pygame.time.Clock()
-        self._fps         = 0.0
+    # ------------------------------------------------------------------
+    # Layout — recalculate radar position/size from surface dimensions
+    # ------------------------------------------------------------------
+
+    def _update_layout(self) -> None:
+        w, h = self.surface.get_size()
+        self._panel_w  = int(w * PANEL_RATIO)
+        radar_area_w   = w - self._panel_w
+        # Radar circle: use 88% of the smaller of radar area width or height
+        self._radar_r  = int(min(radar_area_w, h) * 0.44)
+        # Centre: horizontally centred in right area, vertically centred
+        self._radar_cx = self._panel_w + radar_area_w // 2
+        self._radar_cy = h // 2
+        self._proj     = Projector(
+            self.bbox, self._radar_cx, self._radar_cy, self._radar_r
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def draw(self, flights: list[Flight]) -> None:
+    def set_location(self, name: str) -> None:
         """
-        Main draw call. Call once per frame.
-        Draws all layers onto self.surface in correct order.
+        Switch to a named preset location.
+
+        Available: dubai, london, newyork, tokyo, paris, sydney, singapore
+        Example:   renderer.set_location("london")
         """
+        if name not in LOCATIONS:
+            print(f"[renderer] Unknown location '{name}'. Available: {list(LOCATIONS)}")
+            return
+        loc_name, bbox = LOCATIONS[name]
+        self.set_bbox(bbox, loc_name)
+
+    def set_bbox(
+        self,
+        bbox: tuple[float, float, float, float],
+        label: str = "CUSTOM",
+    ) -> None:
+        """
+        Set a custom bounding box.
+
+        bbox format: (lat_min, lon_min, lat_max, lon_max)
+        Example: renderer.set_bbox((51.3, -0.6, 51.8, 0.3), "LONDON CLOSE")
+        """
+        self.bbox          = bbox
+        self.location_name = label
+        self._update_layout()
+        self.trails        = TrailStore()
+        self._label_cache.clear()
+
+    def draw(self, flights: list) -> None:
+        """Main draw call — once per frame."""
         w, h = self.surface.get_size()
         self._tick_animation()
 
-        # 1 — Background gradient (cached)
-        self._bg_surf = _draw_background_gradient(
-            self.surface, w, h, self._bg_surf
-        )
+        # 1 — Background
+        self._draw_bg(w, h)
 
-        # 2 — Grid
-        if self.show_grid:
-            _draw_grid(self.surface, self.proj)
-
-        # 3 — Range rings
-        if self.show_rings:
-            _draw_range_rings(self.surface, self.proj, self._pulse_t)
-
-        # 4 — Radar sweep
-        if self.show_scan:
-            _draw_scan_line(self.surface, self.proj, self._scan_angle)
-
-        # 5 — Trails + planes
+        # 2 — Flight trails (drawn before circle overlay clips them)
+        trail_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         active_ids: set[str] = set()
-        label_surf = pygame.Surface((w, h), pygame.SRCALPHA)
 
         for flight in flights:
             active_ids.add(flight.icao24)
-            self._draw_flight(label_surf, flight)
+            self.trails.update(flight.icao24, flight.longitude, flight.latitude)
+            if self.show_trails and self._proj.in_radar(flight.longitude, flight.latitude):
+                trail_geo = self.trails.get(flight.icao24)
+                if len(trail_geo) >= 2:
+                    trail_px = [self._proj.project(lon, lat) for lon, lat in trail_geo]
+                    _draw_trail(trail_surf, trail_px, C_TRAIL_HEAD, C_TRAIL_TAIL)
 
-        # Composite label layer on top (avoids z-order issues)
+        self.surface.blit(trail_surf, (0, 0))
+
+        # 3 — Clip everything to circle (erases trails outside radius)
+        _clip_to_circle(self.surface, self._radar_cx, self._radar_cy, self._radar_r)
+
+        # 4 — Radar rings, sweep, pulse (on top of clipped trails)
+        _draw_radar(
+            self.surface,
+            self._radar_cx, self._radar_cy, self._radar_r,
+            self._pulse_t, self._scan_angle,
+        )
+
+        # 5 — Plane icons + labels (only inside circle)
+        label_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        for flight in flights:
+            if self._proj.in_radar(flight.longitude, flight.latitude):
+                self._draw_flight(label_surf, flight)
         self.surface.blit(label_surf, (0, 0))
 
         # Prune stale trails
         self.trails.prune(active_ids)
 
-        # 6 — HUD overlay
-        _draw_hud(
+        # 6 — Left panel (drawn last — always on top)
+        _draw_left_panel(
             self.surface,
             self._font_title,
-            self._font_hud,
-            len(flights),
+            self._font_ptitle,
+            self._font_panel,
+            flights,
             self.bbox,
+            self.location_name,
             self._fps,
+            self._panel_w,
         )
 
         self._fps = self._fps_clock.get_fps()
         self._fps_clock.tick()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal
     # ------------------------------------------------------------------
 
+    def _draw_bg(self, w: int, h: int) -> None:
+        if self._bg_surf is None or self._bg_surf.get_size() != (w, h):
+            self._bg_surf = pygame.Surface((w, h))
+            for y in range(h):
+                t = y / h
+                col = _lerp_colour(C_BG, C_BG2, t)
+                pygame.draw.line(self._bg_surf, col, (0, y), (w, y))
+        self.surface.blit(self._bg_surf, (0, 0))
+
     def _tick_animation(self) -> None:
-        dt = 1 / 60                        # assume ~60 fps for smooth anim
-        self._scan_angle  = (self._scan_angle + 0.8) % 360
-        self._pulse_t     = (self._pulse_t + 0.004) % 1.0
+        self._scan_angle = (self._scan_angle + 0.7) % 360
+        self._pulse_t    = (self._pulse_t + 0.003) % 1.0
 
-    def _draw_flight(
-        self,
-        label_surf: pygame.Surface,
-        flight: Flight,
-    ) -> None:
-        """Draw one flight: trail → icon → label."""
-        cx, cy = self.proj.project(flight.longitude, flight.latitude)
-
-        # Update trail store
-        self.trails.update(flight.icao24, flight.longitude, flight.latitude)
-
-        # Trail
-        if self.show_trails:
-            trail_geo = self.trails.get(flight.icao24)
-            if len(trail_geo) >= 2:
-                trail_px = [
-                    self.proj.project(lon, lat) for lon, lat in trail_geo
-                ]
-                trail_layer = pygame.Surface(
-                    self.surface.get_size(), pygame.SRCALPHA
-                )
-                _draw_trail(
-                    trail_layer, trail_px, C_TRAIL_HEAD, C_TRAIL_TAIL
-                )
-                self.surface.blit(trail_layer, (0, 0))
-
-        # Plane icon
+    def _draw_flight(self, label_surf: pygame.Surface, flight) -> None:
+        cx, cy = self._proj.project(flight.longitude, flight.latitude)
         colour = _plane_colour(flight.velocity)
-        _draw_plane_icon(
-            self.surface, cx, cy, flight.heading, colour
-        )
-
-        # Labels
+        _draw_plane_icon(self.surface, cx, cy, flight.heading, colour)
         if self.show_labels:
             self._draw_label(label_surf, flight, cx, cy, colour)
 
-    def _draw_label(
-        self,
-        surf: pygame.Surface,
-        flight: Flight,
-        cx: int,
-        cy: int,
-        colour: tuple[int, int, int],
-    ) -> None:
-        """Draw callsign + altitude tag near the plane icon."""
-        # Build or retrieve cached label surfaces
+    def _draw_label(self, surf, flight, cx, cy, colour) -> None:
         if flight.icao24 not in self._label_cache:
-            callsign = flight.callsign or flight.icao24.upper()
-            alt_ft   = int(flight.altitude * 3.28084)     # metres → feet
-            cs_surf  = self._font_label.render(callsign, True, C_LABEL_CALL)
-            alt_surf = self._font_label.render(
-                f"FL{alt_ft // 100:03d}", True, C_LABEL_ALT
-            )
-            self._label_cache[flight.icao24] = (cs_surf, alt_surf)
-
-        cs_surf, alt_surf = self._label_cache[flight.icao24]
-
-        ox, oy = 10, -18          # offset from plane centre
-        surf.blit(cs_surf,  (cx + ox, cy + oy))
-        surf.blit(alt_surf, (cx + ox, cy + oy + LABEL_FONT_SIZE + 1))
-
-        # Tiny connector line from label to plane
-        lx = cx + ox - 2
-        ly = cy + oy + LABEL_FONT_SIZE
-        pygame.draw.line(surf, (*colour, 80), (cx, cy), (lx, ly), 1)
+            cs  = (flight.callsign or flight.icao24.upper())
+            alt = int(flight.altitude * 3.28084)
+            cs_s  = self._font_label.render(cs, True, C_LABEL_CALL)
+            alt_s = self._font_label.render(f"FL{alt//100:03d}", True, C_LABEL_ALT)
+            self._label_cache[flight.icao24] = (cs_s, alt_s)
+        cs_s, alt_s = self._label_cache[flight.icao24]
+        ox, oy = 10, -16
+        surf.blit(cs_s,  (cx + ox, cy + oy))
+        surf.blit(alt_s, (cx + ox, cy + oy + LABEL_FONT_SIZE + 2))
+        pygame.draw.line(surf, (*colour, 60), (cx, cy), (cx + ox - 2, cy + oy + LABEL_FONT_SIZE), 1)
 
     def invalidate_label_cache(self) -> None:
-        """Call when flights are refreshed from API to clear stale labels."""
         self._label_cache.clear()
 
     def resize(self, new_w: int, new_h: int) -> None:
-        """Handle window resize — update projector and clear bg cache."""
-        self.proj    = Projector(self.bbox, new_w, new_h)
         self._bg_surf = None
-
-    def set_bbox(self, bbox: tuple[float, float, float, float]) -> None:
-        """Change the geographic bounding box at runtime."""
-        self.bbox = bbox
-        w, h = self.surface.get_size()
-        self.proj = Projector(bbox, w, h)
-        self.trails = TrailStore()              # trails no longer valid
-        self._label_cache.clear()
+        self._update_layout()

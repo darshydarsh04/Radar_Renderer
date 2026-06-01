@@ -7,6 +7,7 @@ from src.fetcher import fetch_flights
 from src.renderer import Renderer
 import threading, time
 
+
 flights = []
 lock = threading.Lock()
 
@@ -32,6 +33,8 @@ def main():
 
     renderer = Renderer(screen)
     clock = pygame.time.Clock()
+
+    renderer.set_location("Edinburgh Airport")
 
     while True:
         for event in pygame.event.get():

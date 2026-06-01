@@ -1,5 +1,6 @@
 # src/fetcher.py
 import requests
+import json
 from src.config import BBOX, POLL_INTERVAL
 from src.flight import Flight
 
@@ -14,6 +15,27 @@ def fetch_flights() -> list[Flight]:
         states = resp.json().get("states") or []
         flights = [Flight.from_opensky(s) for s in states]
         return [f for f in flights if f is not None]
-    except requests.RequestException as e:
+    except Exception as e:
+
         print(f"[fetcher] API error: {e}")
         return []   # graceful degradation — don't crash the wallpaper
+
+
+# Add this to fetcher.py for Phase 2 GNOME extension support
+
+def write_flights_for_gnome(flights: list[Flight]) -> None:
+    """Write flight positions to /tmp/flights.json for the GNOME extension."""
+    data = [
+        {
+            "icao24":   f.icao24,
+            "callsign": f.callsign,
+            "lon":      f.longitude,
+            "lat":      f.latitude,
+            "heading":  f.heading,
+            "altitude": f.altitude,
+            "velocity": f.velocity,
+        }
+        for f in flights
+    ]
+    with open("/tmp/flights.json", "w") as fh:
+        json.dump(data, fh)
