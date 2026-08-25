@@ -310,26 +310,84 @@ class TestRendererSetLocation:
         assert r._label_cache == {}
 
 
-class TestRendererSetBbox:
+class TestRendererZoomPan:
     @_patch_fonts
-    def test_custom_bbox_and_label(self):
+    def test_zoom_in_shrinks_bbox(self):
         r = Renderer(_mock_surf())
-        r.set_bbox((48.0, 2.0, 51.0, 5.0), "PARIS CLOSE")
-        assert r.bbox == (48.0, 2.0, 51.0, 5.0)
-        assert r.location_name == "PARIS CLOSE"
+        lat_span_before = r.bbox[2] - r.bbox[0]
+        r.zoom(0.5)
+        lat_span_after = r.bbox[2] - r.bbox[0]
+        assert lat_span_after < lat_span_before
 
     @_patch_fonts
-    def test_set_bbox_updates_projector(self):
+    def test_zoom_out_grows_bbox(self):
         r = Renderer(_mock_surf())
-        r.set_bbox((48.0, 2.0, 51.0, 5.0))
-        assert r._proj.lat_min == pytest.approx(48.0)
+        lat_span_before = r.bbox[2] - r.bbox[0]
+        r.zoom(2.0)
+        lat_span_after = r.bbox[2] - r.bbox[0]
+        assert lat_span_after > lat_span_before
 
     @_patch_fonts
-    def test_set_bbox_clears_trails(self):
+    def test_zoom_preserves_centre(self):
         r = Renderer(_mock_surf())
-        r.trails.update("a", 55.0, 25.0)
-        r.set_bbox((48.0, 2.0, 51.0, 5.0))
-        assert r.trails.get("a") == []
+        mid_lat = (r.bbox[0] + r.bbox[2]) / 2
+        mid_lon = (r.bbox[1] + r.bbox[3]) / 2
+        r.zoom(0.5)
+        new_mid_lat = (r.bbox[0] + r.bbox[2]) / 2
+        new_mid_lon = (r.bbox[1] + r.bbox[3]) / 2
+        assert new_mid_lat == pytest.approx(mid_lat, abs=0.01)
+        assert new_mid_lon == pytest.approx(mid_lon, abs=0.01)
+
+    @_patch_fonts
+    def test_zoom_in_clamps_at_min(self):
+        r = Renderer(_mock_surf())
+        for _ in range(30):
+            r.zoom(0.1)
+        lat_span = r.bbox[2] - r.bbox[0]
+        from src.renderer import MIN_ZOOM_SPAN
+        assert lat_span >= MIN_ZOOM_SPAN
+
+    @_patch_fonts
+    def test_pan_north_increases_lat(self):
+        r = Renderer(_mock_surf())
+        mid_lat_before = (r.bbox[0] + r.bbox[2]) / 2
+        r.pan(1.0, 0)
+        mid_lat_after = (r.bbox[0] + r.bbox[2]) / 2
+        assert mid_lat_after > mid_lat_before
+
+    @_patch_fonts
+    def test_pan_east_increases_lon(self):
+        r = Renderer(_mock_surf())
+        mid_lon_before = (r.bbox[1] + r.bbox[3]) / 2
+        r.pan(0, 1.0)
+        mid_lon_after = (r.bbox[1] + r.bbox[3]) / 2
+        assert mid_lon_after > mid_lon_before
+
+    @_patch_fonts
+    def test_reset_zoom_restores_original_bbox(self):
+        r = Renderer(_mock_surf(), location="dubai")
+        original_bbox = r.bbox
+        r.zoom(0.3)
+        r.pan(2.0, 2.0)
+        r.reset_zoom()
+        assert r.bbox == original_bbox
+
+    @_patch_fonts
+    def test_toggle_airport_mode_changes_bbox(self):
+        r = Renderer(_mock_surf(), location="dubai")
+        city_bbox = r.bbox
+        r.toggle_airport_mode()
+        assert r.bbox != city_bbox
+        assert r._airport_mode is True
+
+    @_patch_fonts
+    def test_toggle_airport_mode_twice_returns_to_city(self):
+        r = Renderer(_mock_surf(), location="dubai")
+        city_bbox = r.bbox
+        r.toggle_airport_mode()
+        r.toggle_airport_mode()
+        assert r._airport_mode is False
+        assert r.bbox == city_bbox
 
 
 class TestRendererAnimation:
