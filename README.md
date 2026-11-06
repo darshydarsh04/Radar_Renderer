@@ -9,10 +9,12 @@ A live flight radar for Ubuntu (GNOME on Wayland), built in Python with Pygame. 
 - **Plane icons and trails**: heading-aware icons coloured by speed, with fading position trails
 - **Airports**: large and medium airports plotted from a local `airports.csv`
 - **Routes**: origin and destination per flight (fetched lazily and cached), drawn as lines on the radar
-- **City silhouettes**: rough skyline behind the radar for each preset city
 - **Flight panel**: callsign, route, flight level and speed for every aircraft in view
 - **Zoom and pan**: change the visible area live
+
+## new Features, may have bugs
 - **Two view modes**: city/regional view and airport close-up view
+- **City silhouettes**: rough skyline behind the radar for each preset city
 
 ## Requirements
 
