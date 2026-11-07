@@ -15,6 +15,7 @@ A live flight radar for Ubuntu (GNOME on Wayland), built in Python with Pygame. 
 ## new Features, may have bugs
 - **Two view modes**: city/regional view and airport close-up view
 - **City silhouettes**: rough skyline behind the radar for each preset city
+- **wallpaper engine**: still testing period for the wallpaper engine to work properly 
 
 ## Requirements
 
